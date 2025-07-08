@@ -105,8 +105,8 @@ Add to your client configuration (e.g. `claude_desktop_config.json`):
 {
   "mcpServers": {
     "dicom": {
-      "command": "uv",
-      "args": ["tool","dicom-mcp", "/path/to/your_config.yaml"]
+      "command": "uvx",
+      "args": ["dicom-mcp", "/path/to/your_config.yaml"]
     }
   }
 }
