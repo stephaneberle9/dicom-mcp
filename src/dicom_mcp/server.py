@@ -9,6 +9,7 @@ from typing import Dict, List, Any, AsyncIterator
 
 from fastmcp import FastMCP, Context
 from fastmcp.apps import AppConfig, ResourceCSP
+from fastmcp.tools.tool import ToolResult
 
 from .attributes import ATTRIBUTE_PRESETS
 from .dicom_client import DicomClient
@@ -115,6 +116,128 @@ app.ontoolresult = async (result) => {
     await renderPdf(b64ToBytes(data.pdf_base64));
   } catch (e) {
     showFallback(data.text_content, "PDF-Rendering fehlgeschlagen (" + e + ") – Textfassung:");
+  }
+};
+
+await app.connect();
+const ctx = app.getHostContext?.();
+if (ctx?.theme === "dark") document.documentElement.classList.add("dark");
+app.onhostcontextchanged = (c) =>
+  document.documentElement.classList.toggle("dark", c?.theme === "dark");
+</script>
+</body>
+</html>
+"""
+
+
+# Image gallery widget: shows the VL Endoscopic Images of a series as a thumbnail grid
+# with a click-to-enlarge lightbox. Images arrive as base64 data URLs (original JPEG where
+# possible), so no external image domains are needed - only the ext-apps runtime from unpkg.
+IMAGE_GALLERY_WIDGET_HTML = """<!doctype html>
+<html>
+<head><meta charset="utf-8">
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px system-ui, sans-serif; margin: 0; padding: 12px;
+         background: #f7f7f8; color: #111; }
+  html.dark body { background: #1e1e20; color: #eee; }
+  h1 { font-size: 14px; margin: 0 0 10px; }
+  #status { color: #666; font-size: 13px; margin-bottom: 10px; }
+  html.dark #status { color: #aaa; }
+  #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; }
+  .thumb { position: relative; aspect-ratio: 4 / 3; border: 1px solid #ddd; border-radius: 8px;
+           overflow: hidden; background: #000; cursor: zoom-in; }
+  html.dark .thumb { border-color: #444; }
+  .thumb img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .thumb .n { position: absolute; left: 6px; top: 6px; background: rgba(0,0,0,.6);
+              color: #fff; font-size: 11px; padding: 1px 6px; border-radius: 6px; }
+  #lb { position: fixed; inset: 0; background: rgba(0,0,0,.9); display: none;
+        align-items: center; justify-content: center; cursor: zoom-out; padding: 16px; }
+  #lb.open { display: flex; }
+  #lb img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  #lbstatus { position: absolute; bottom: 14px; left: 0; right: 0; text-align: center;
+              color: #fff; font-size: 13px; }
+  /* While a full image is shown (esp. in fullscreen) hide the grid so only the image shows. */
+  body.viewing h1, body.viewing #status, body.viewing #grid { display: none; }
+  #lb.open { min-height: 100vh; }
+</style></head>
+<body>
+  <h1>🩺 Endoskopie-Bilder</h1>
+  <div id="status">Lade Bilder &hellip;</div>
+  <div id="grid"></div>
+  <div id="lb"><img id="lbimg" alt=""><div id="lbstatus"></div></div>
+<script type="module">
+import { App } from "https://unpkg.com/@modelcontextprotocol/ext-apps@0.4.0/app-with-deps";
+
+function readToolData(result) {
+  if (result && result.structuredContent && typeof result.structuredContent === "object")
+    return result.structuredContent;
+  const t = (result?.content || []).find(c => c.type === "text");
+  try { return JSON.parse(t?.text || "{}"); } catch (e) { return {}; }
+}
+const statusEl = document.getElementById("status");
+const grid = document.getElementById("grid");
+const lb = document.getElementById("lb");
+const lbimg = document.getElementById("lbimg");
+const lbStatus = document.getElementById("lbstatus");
+lb.addEventListener("click", () => {
+  lb.classList.remove("open");
+  document.body.classList.remove("viewing");
+  requestMode("inline");
+});
+
+const app = new App({ name: "DicomImageGallery", version: "1.0.0" });
+let STUDY = "", SERIES = "";
+
+// Ask the host to grow the widget; falls back silently if display modes aren't supported.
+async function requestMode(mode) {
+  try { await app.requestDisplayMode({ mode }); } catch (e) { /* host may not support it */ }
+}
+
+async function openFull(sop, thumbSrc) {
+  await requestMode("fullscreen");      // so the full image isn't capped by the inline widget size
+  document.body.classList.add("viewing");  // hide the thumbnail grid behind the full image
+  lbimg.src = thumbSrc;                 // show the thumbnail immediately while the full loads
+  lbStatus.textContent = "Lade Vollbild …";
+  lb.classList.add("open");
+  try {
+    const res = await app.callServerTool({
+      name: "get_single_image",
+      arguments: { study_instance_uid: STUDY, series_instance_uid: SERIES, sop_instance_uid: sop },
+    });
+    const d = readToolData(res);
+    if (d.image_base64) {
+      lbimg.src = "data:" + (d.mime_type || "image/jpeg") + ";base64," + d.image_base64;
+      lbStatus.textContent = "Klick zum Schließen";
+    } else {
+      lbStatus.textContent = d.message || "Vollbild nicht verfügbar";
+    }
+  } catch (e) {
+    lbStatus.textContent = "Fehler beim Laden (" + e + ")";
+  }
+}
+
+app.ontoolresult = (result) => {
+  const data = readToolData(result);
+  STUDY = data.study_instance_uid || "";
+  SERIES = data.series_instance_uid || "";
+  const images = (data.images || []).filter(im => im.image_base64);
+  if (!data.success || images.length === 0) {
+    statusEl.textContent = data.message || "Keine Bilder gefunden.";
+    return;
+  }
+  statusEl.textContent = images.length + " Bild(er) – zum Vergrößern anklicken";
+  grid.innerHTML = "";
+  for (const im of images) {
+    const src = "data:" + (im.mime_type || "image/jpeg") + ";base64," + im.image_base64;
+    const cell = document.createElement("div");
+    cell.className = "thumb";
+    cell.innerHTML = '<span class="n">#' + (im.instance_number || "?") + "</span>";
+    const img = document.createElement("img");
+    img.src = src; img.alt = "Frame " + (im.instance_number || "");
+    cell.appendChild(img);
+    cell.addEventListener("click", () => openFull(im.sop_instance_uid, src));
+    grid.appendChild(cell);
   }
 };
 
@@ -733,5 +856,75 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
     def pdf_view_widget() -> str:
         """HTML for the render_pdf_from_dicom PDF viewer UI."""
         return PDF_VIEW_WIDGET_HTML
+
+    # --- Image gallery widget ---------------------------------------------------
+    @mcp.tool(app=AppConfig(resource_uri="ui://dicom/image-gallery.html"))
+    def render_images_from_dicom(
+        study_instance_uid: str,
+        series_instance_uid: str,
+        ctx: Context = None,
+    ) -> ToolResult:
+        """Retrieve the VL Endoscopic Images of a series and show them as an inline gallery.
+
+        Use this when the user wants to *see* the endoscopy images. Retrieves every image of
+        the series via C-GET, downscales them to thumbnails, and shows them in the
+        ui://dicom/image-gallery.html widget (thumbnail grid + click-to-enlarge lightbox that
+        lazy-loads the full image via get_single_image).
+
+        Get the UIDs from a query first (query_studies -> query_series); point at the image
+        series (Modality ES / VL Endoscopic Image), not the report (SR/PDF) series.
+
+        Args:
+            study_instance_uid: Study Instance UID
+            series_instance_uid: Series Instance UID
+        """
+        dicom_ctx = ctx.request_context.lifespan_context
+        client: DicomClient = dicom_ctx.client
+        data = client.get_images_from_dicom(
+            study_instance_uid=study_instance_uid,
+            series_instance_uid=series_instance_uid,
+        )
+        # Keep the base64 thumbnails out of the model's context (a full gallery can exceed
+        # the tool-result size limit) - the widget reads them from structured_content.
+        summary = (f"Retrieved {data.get('count', 0)} endoscopy image(s); shown in the gallery widget."
+                   if data.get("success") else data.get("message", "No images."))
+        return ToolResult(content=summary, structured_content=data)
+
+    @mcp.tool()
+    def get_single_image(
+        study_instance_uid: str,
+        series_instance_uid: str,
+        sop_instance_uid: str,
+        ctx: Context = None,
+    ) -> ToolResult:
+        """Retrieve one full-resolution endoscopy image (used by the gallery lightbox).
+
+        Returns the full-resolution frame base64-encoded in structured_content. Primarily
+        called by the image gallery widget when the user enlarges a thumbnail; to *show*
+        images the model should use render_images_from_dicom instead.
+
+        Args:
+            study_instance_uid: Study Instance UID
+            series_instance_uid: Series Instance UID
+            sop_instance_uid: SOP Instance UID of the image to enlarge
+        """
+        dicom_ctx = ctx.request_context.lifespan_context
+        client: DicomClient = dicom_ctx.client
+        data = client.get_single_image(
+            study_instance_uid=study_instance_uid,
+            series_instance_uid=series_instance_uid,
+            sop_instance_uid=sop_instance_uid,
+        )
+        summary = ("Retrieved full-resolution image." if data.get("success")
+                   else data.get("message", "No image."))
+        return ToolResult(content=summary, structured_content=data)
+
+    @mcp.resource(
+        "ui://dicom/image-gallery.html",
+        app=AppConfig(csp=ResourceCSP(resource_domains=["https://unpkg.com"])),
+    )
+    def image_gallery_widget() -> str:
+        """HTML for the render_images_from_dicom gallery UI."""
+        return IMAGE_GALLERY_WIDGET_HTML
 
     return mcp
