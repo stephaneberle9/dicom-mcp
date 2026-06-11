@@ -650,6 +650,55 @@ class DicomClient:
             "file_path": dicom_file,
         }
 
+    def get_pdf_from_dicom(
+            self,
+            study_instance_uid: str,
+            series_instance_uid: str,
+            sop_instance_uid: str
+        ) -> Dict[str, Any]:
+        """Retrieve a DICOM-encapsulated PDF via C-GET and return it base64-encoded.
+
+        Intended for the render_pdf_from_dicom widget, which renders the bytes inline
+        (pdf.js). Returns ``{success, message, pdf_base64, size_bytes, file_path}``.
+        """
+        ds, error, dicom_file = self._retrieve_pdf_dataset(
+            study_instance_uid, series_instance_uid, sop_instance_uid)
+        if ds is None:
+            return {"success": False, "message": error,
+                    "pdf_base64": "", "size_bytes": 0, "file_path": dicom_file}
+
+        try:
+            pdf_data = bytes(ds.EncapsulatedDocument)
+            import base64
+            pdf_b64 = base64.b64encode(pdf_data).decode("ascii")
+        except Exception as exc:
+            return {
+                "success": False,
+                "message": f"Instance retrieved, but the embedded PDF could not be read: {exc}.",
+                "pdf_base64": "", "size_bytes": 0, "text_content": "", "file_path": dicom_file,
+            }
+
+        # Best-effort text extraction alongside the bytes: gives the widget a text
+        # fallback and lets hosts without widget support (or the model itself) still
+        # read the report. Never fail the call just because PyPDF2 can't parse it.
+        text_content = ""
+        try:
+            import io
+            import PyPDF2
+            reader = PyPDF2.PdfReader(io.BytesIO(pdf_data))
+            text_content = "\n".join(page.extract_text() for page in reader.pages)
+        except Exception:
+            text_content = ""
+
+        return {
+            "success": True,
+            "message": "Successfully retrieved PDF from DICOM",
+            "pdf_base64": pdf_b64,
+            "size_bytes": len(pdf_data),
+            "text_content": text_content,
+            "file_path": dicom_file,
+        }
+    
     @staticmethod
     def _dataset_to_dict(dataset: Dataset) -> Dict[str, Any]:
         """Convert a DICOM dataset to a dictionary.
