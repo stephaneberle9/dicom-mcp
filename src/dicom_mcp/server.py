@@ -55,7 +55,6 @@ PDF_VIEW_WIDGET_HTML = """<!doctype html>
 <body>
   <div class="bar">
     <h1>📄 DICOM-Bericht (Encapsulated PDF)</h1>
-    <button id="open" class="hidden">In neuem Tab öffnen</button>
   </div>
   <div id="status">Lade PDF &hellip;</div>
   <div id="pages"></div>
@@ -80,7 +79,6 @@ function b64ToBytes(b64) {
 const statusEl = document.getElementById("status");
 const pagesEl  = document.getElementById("pages");
 const fbEl     = document.getElementById("fallback");
-const openBtn  = document.getElementById("open");
 
 function showFallback(text, note) {
   pagesEl.classList.add("hidden");
@@ -113,8 +111,6 @@ app.ontoolresult = async (result) => {
     showFallback(data.text_content, data.message || "PDF konnte nicht geladen werden.");
     return;
   }
-  openBtn.classList.remove("hidden");
-  openBtn.onclick = () => app.openLink({ url: "data:application/pdf;base64," + data.pdf_base64 });
   try {
     await renderPdf(b64ToBytes(data.pdf_base64));
   } catch (e) {
