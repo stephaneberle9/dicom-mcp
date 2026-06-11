@@ -8,10 +8,12 @@ from dataclasses import dataclass
 from typing import Dict, List, Any, AsyncIterator
 
 from fastmcp import FastMCP, Context
+from fastmcp.apps import AppConfig, ResourceCSP
 
 from .attributes import ATTRIBUTE_PRESETS
 from .dicom_client import DicomClient
 from .config import DicomConfiguration, load_config
+
 
 # Configure logging
 logger = logging.getLogger("dicom_mcp")
@@ -22,6 +24,113 @@ class DicomContext:
     """Context for the DICOM MCP server."""
     config: DicomConfiguration
     client: DicomClient
+
+
+# PDF viewer widget: renders an Encapsulated-PDF report inline via pdf.js (canvas).
+# pdf.js + the ext-apps runtime load from CDNs, which the iframe CSP must allow-list.
+# If rendering fails (CSP/worker blocked, malformed PDF), the widget degrades to the
+# server-extracted text fallback so the report is still readable.
+PDF_VIEW_WIDGET_HTML = """<!doctype html>
+<html>
+<head><meta charset="utf-8">
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px system-ui, sans-serif; margin: 0; padding: 12px;
+         background: #f7f7f8; color: #111; }
+  html.dark body { background: #1e1e20; color: #eee; }
+  .bar { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .bar h1 { font-size: 14px; margin: 0; flex: 1; }
+  button { font: 13px system-ui; padding: 4px 10px; border-radius: 6px;
+           border: 1px solid #ccc; background: #fff; cursor: pointer; }
+  html.dark button { background: #333; color: #eee; border-color: #555; }
+  #pages canvas { width: 100%; height: auto; display: block; margin: 0 auto 10px;
+                  border: 1px solid #ddd; border-radius: 6px; background: #fff; }
+  #status { color: #666; font-size: 13px; }
+  html.dark #status { color: #aaa; }
+  #fallback { white-space: pre-wrap; font: 13px ui-monospace, monospace;
+              background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 10px; }
+  html.dark #fallback { background: #2a2a2d; border-color: #444; }
+  .hidden { display: none; }
+</style></head>
+<body>
+  <div class="bar">
+    <h1>📄 DICOM-Bericht (Encapsulated PDF)</h1>
+    <button id="open" class="hidden">In neuem Tab öffnen</button>
+  </div>
+  <div id="status">Lade PDF &hellip;</div>
+  <div id="pages"></div>
+  <pre id="fallback" class="hidden"></pre>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"
+        integrity="sha512-q+4liFwdPC/bNdhUpZx6aXDx/h77yEQtn4I1slHydcbZK34nLaR3cAeYSJshoxIOq3mjEf7xJE8YWIUHMn+oCQ=="
+        crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script type="module">
+import { App } from "https://unpkg.com/@modelcontextprotocol/ext-apps@0.4.0/app-with-deps";
+
+function readToolData(result) {
+  if (result && result.structuredContent && typeof result.structuredContent === "object")
+    return result.structuredContent;
+  const t = (result?.content || []).find(c => c.type === "text");
+  try { return JSON.parse(t?.text || "{}"); } catch (e) { return {}; }
+}
+function b64ToBytes(b64) {
+  const bin = atob(b64), len = bin.length, bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+const statusEl = document.getElementById("status");
+const pagesEl  = document.getElementById("pages");
+const fbEl     = document.getElementById("fallback");
+const openBtn  = document.getElementById("open");
+
+function showFallback(text, note) {
+  pagesEl.classList.add("hidden");
+  fbEl.classList.remove("hidden");
+  fbEl.textContent = text || "(kein Text extrahierbar)";
+  statusEl.textContent = note || "PDF-Vorschau nicht verfügbar – Textfassung:";
+}
+
+async function renderPdf(bytes) {
+  const pdfjsLib = window.pdfjsLib;
+  if (!pdfjsLib) throw new Error("pdf.js nicht geladen (CSP?)");
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
+  statusEl.textContent = pdf.numPages + " Seite(n)";
+  for (let n = 1; n <= pdf.numPages; n++) {
+    const page = await pdf.getPage(n);
+    const viewport = page.getViewport({ scale: 1.5 });
+    const canvas = document.createElement("canvas");
+    canvas.width = viewport.width; canvas.height = viewport.height;
+    pagesEl.append(canvas);
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+  }
+}
+
+const app = new App({ name: "DicomPdfView", version: "1.0.0" });
+app.ontoolresult = async (result) => {
+  const data = readToolData(result);
+  if (!data.success || !data.pdf_base64) {
+    showFallback(data.text_content, data.message || "PDF konnte nicht geladen werden.");
+    return;
+  }
+  openBtn.classList.remove("hidden");
+  openBtn.onclick = () => app.openLink({ url: "data:application/pdf;base64," + data.pdf_base64 });
+  try {
+    await renderPdf(b64ToBytes(data.pdf_base64));
+  } catch (e) {
+    showFallback(data.text_content, "PDF-Rendering fehlgeschlagen (" + e + ") – Textfassung:");
+  }
+};
+
+await app.connect();
+const ctx = app.getHostContext?.();
+if (ctx?.theme === "dark") document.documentElement.classList.add("dark");
+app.onhostcontextchanged = (c) =>
+  document.documentElement.classList.toggle("dark", c?.theme === "dark");
+</script>
+</body>
+</html>
+"""
 
 
 def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMCP:
@@ -583,5 +692,50 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
             }
         """
         return ATTRIBUTE_PRESETS
-    
+
+    # --- PDF viewer widget ------------------------------------------------------
+    @mcp.tool(app=AppConfig(resource_uri="ui://dicom/pdf-view.html"))
+    def render_pdf_from_dicom(
+        study_instance_uid: str,
+        series_instance_uid: str,
+        sop_instance_uid: str,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        """Retrieve a DICOM-encapsulated PDF report and render it inline (PDF viewer).
+
+        Use this when the user wants to *see* the report, not just read its text. Retrieves
+        the Encapsulated PDF instance via C-GET and returns it base64-encoded so the
+        ui://dicom/pdf-view.html widget renders the pages with pdf.js. Also returns the
+        extracted text as a fallback for hosts that don't render widgets.
+
+        Get the three UIDs from a query first (query_studies -> query_series ->
+        query_instances); the target must be an Encapsulated PDF instance.
+
+        Args:
+            study_instance_uid: Study Instance UID
+            series_instance_uid: Series Instance UID
+            sop_instance_uid: SOP Instance UID
+
+        Returns:
+            Dictionary: { success, message, pdf_base64, size_bytes, text_content, file_path }
+        """
+        dicom_ctx = ctx.request_context.lifespan_context
+        client: DicomClient = dicom_ctx.client
+        return client.get_pdf_from_dicom(
+            study_instance_uid=study_instance_uid,
+            series_instance_uid=series_instance_uid,
+            sop_instance_uid=sop_instance_uid,
+        )
+
+    @mcp.resource(
+        "ui://dicom/pdf-view.html",
+        app=AppConfig(csp=ResourceCSP(
+            resource_domains=["https://unpkg.com", "https://cdnjs.cloudflare.com"],
+            connect_domains=["https://cdnjs.cloudflare.com"],
+        )),
+    )
+    def pdf_view_widget() -> str:
+        """HTML for the render_pdf_from_dicom PDF viewer UI."""
+        return PDF_VIEW_WIDGET_HTML
+
     return mcp
