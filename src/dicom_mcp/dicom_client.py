@@ -20,7 +20,8 @@ from pynetdicom.sop_class import (
     StudyRootQueryRetrieveInformationModelGet,
     StudyRootQueryRetrieveInformationModelMove,    # For C-MOVE
     Verification,
-    EncapsulatedPDFStorage
+    EncapsulatedPDFStorage,
+    VLEndoscopicImageStorage,
 )
 
 from .attributes import get_attributes_for_level
@@ -56,7 +57,15 @@ class DicomClient:
         
         # Add specific storage context for PDF - instead of adding all storage contexts
         self.ae.add_requested_context(EncapsulatedPDFStorage)
-    
+
+        # VL Endoscopic Image for the image gallery. Offer JPEG Baseline first so the
+        # peer returns the original (small) JPEG instead of transcoding to uncompressed
+        # RGB (~19.5 MB/frame); uncompressed Little Endian is kept as a fallback.
+        self.ae.add_requested_context(
+            VLEndoscopicImageStorage,
+            ["1.2.840.10008.1.2.4.50", "1.2.840.10008.1.2.1"],
+        )
+
     def verify_connection(self) -> Tuple[bool, str]:
         """Verify connectivity to the DICOM node using C-ECHO.
         
@@ -698,7 +707,176 @@ class DicomClient:
             "text_content": text_content,
             "file_path": dicom_file,
         }
-    
+
+    def _c_get_image_datasets(self, study_instance_uid, series_instance_uid,
+                              sop_instance_uid=None) -> Tuple[List[Dataset], Optional[str]]:
+        """C-GET VL Endoscopic Image instances (series- or image-level) into memory.
+
+        Returns ``(received_datasets, error_message)``; on success the message is None.
+        """
+        received: List[Dataset] = []
+
+        def handle_store(event):
+            ds = event.dataset
+            ds.file_meta = event.file_meta
+            received.append(ds)
+            return 0x0000
+
+        role = build_role(VLEndoscopicImageStorage, scp_role=True)
+        assoc = self.ae.associate(
+            self.host, self.port, ae_title=self.called_aet,
+            evt_handlers=[(evt.EVT_C_STORE, handle_store)], ext_neg=[role],
+        )
+        if not assoc.is_established:
+            return [], f"Failed to associate with DICOM node at {self.host}:{self.port}"
+
+        query = Dataset()
+        query.StudyInstanceUID = study_instance_uid
+        query.SeriesInstanceUID = series_instance_uid
+        if sop_instance_uid:
+            query.QueryRetrieveLevel = "IMAGE"
+            query.SOPInstanceUID = sop_instance_uid
+        else:
+            query.QueryRetrieveLevel = "SERIES"
+
+        timeout_msg = None
+        final_status = None
+        try:
+            for (status, _ds) in assoc.send_c_get(query, PatientRootQueryRetrieveInformationModelGet):
+                if status:
+                    final_status = status
+                else:
+                    timeout_msg = ("C-GET failed: no response from the peer "
+                                   "(association aborted or DIMSE timeout)")
+        except Exception as exc:
+            timeout_msg = f"C-GET request raised an error: {exc}"
+        finally:
+            assoc.release()
+
+        if not received:
+            status_hex = (f"0x{final_status.Status:04x}"
+                          if final_status is not None and hasattr(final_status, "Status") else "n/a")
+            failed = getattr(final_status, "NumberOfFailedSuboperations", None)
+            if failed:
+                msg = (f"C-GET matched instance(s) but the transfer failed (final status "
+                       f"{status_hex}, {failed} failed sub-operation(s)). The series/instance may "
+                       f"not be a VL Endoscopic Image, or the peer could not provide it.")
+            else:
+                msg = (timeout_msg or
+                       f"C-GET returned no instances (final status {status_hex}). The UIDs were not "
+                       f"found on '{self.called_aet}' - they may be stale. Re-run a query (C-FIND).")
+            return [], msg
+        return received, None
+
+    @staticmethod
+    def _frame_to_pil(ds):
+        """Decode one frame of a (possibly JPEG-encapsulated) image to a PIL RGB image.
+
+        Returns ``(pil_image, original_jpeg_bytes_or_None)``. For an already-JPEG frame the
+        original bytes are returned too, so the full-image path can pass them through
+        without a lossy re-encode.
+        """
+        import io
+        from PIL import Image
+        ts = ds.file_meta.TransferSyntaxUID
+        if ts.is_encapsulated:
+            from pydicom.encaps import generate_frames
+            n = int(ds.get("NumberOfFrames", 1) or 1)
+            jpeg = next(generate_frames(ds.PixelData, number_of_frames=n)).rstrip(b"\x00")
+            return Image.open(io.BytesIO(jpeg)).convert("RGB"), jpeg
+        return Image.fromarray(ds.pixel_array).convert("RGB"), None
+
+    def get_images_from_dicom(self, study_instance_uid, series_instance_uid) -> Dict[str, Any]:
+        """Retrieve a series' VL Endoscopic Images as small thumbnails for the gallery.
+
+        Full frames are large (~0.2 MB JPEG each); the gallery only needs thumbnails, so
+        each frame is downscaled. The widget fetches a full image on demand (get_single_image)
+        when the user enlarges one.
+
+        Returns: { success, message, count, study_instance_uid, series_instance_uid,
+                   images: [ {sop_instance_uid, instance_number, mime_type, image_base64,
+                   rows, columns} ] } -- image_base64 is the THUMBNAIL.
+        """
+        import base64
+        import io
+
+        received, error = self._c_get_image_datasets(study_instance_uid, series_instance_uid)
+        base = {"study_instance_uid": study_instance_uid,
+                "series_instance_uid": series_instance_uid}
+        if error:
+            return {"success": False, "count": 0, "images": [], "message": error, **base}
+
+        THUMB_MAX = 512
+        images = []
+        for ds in received:
+            entry = {
+                "sop_instance_uid": str(getattr(ds, "SOPInstanceUID", "")),
+                "instance_number": int(ds.get("InstanceNumber", 0) or 0),
+                "rows": int(ds.get("Rows", 0) or 0),
+                "columns": int(ds.get("Columns", 0) or 0),
+            }
+            try:
+                pil, _ = self._frame_to_pil(ds)
+                pil.thumbnail((THUMB_MAX, THUMB_MAX))
+                buf = io.BytesIO()
+                pil.save(buf, format="JPEG", quality=72)
+                entry["mime_type"] = "image/jpeg"
+                entry["image_base64"] = base64.b64encode(buf.getvalue()).decode("ascii")
+            except Exception as exc:
+                entry["error"] = f"could not encode thumbnail: {exc}"
+            images.append(entry)
+
+        images.sort(key=lambda x: x.get("instance_number", 0))
+        ok = [im for im in images if "image_base64" in im]
+        return {
+            "success": bool(ok),
+            "count": len(ok),
+            "message": f"Retrieved {len(ok)} image(s) from series" if ok else
+                       "Frames were received but none could be decoded",
+            "images": images,
+            **base,
+        }
+
+    def get_single_image(self, study_instance_uid, series_instance_uid,
+                         sop_instance_uid) -> Dict[str, Any]:
+        """Retrieve one full-resolution VL Endoscopic Image (for the gallery lightbox).
+
+        Returns: { success, message, sop_instance_uid, mime_type, image_base64, rows,
+                   columns }. image_base64 is the original JPEG where available, else a PNG.
+        """
+        import base64
+        import io
+
+        received, error = self._c_get_image_datasets(
+            study_instance_uid, series_instance_uid, sop_instance_uid)
+        if error:
+            return {"success": False, "image_base64": "", "message": error,
+                    "sop_instance_uid": sop_instance_uid}
+
+        ds = received[0]
+        try:
+            pil, jpeg = self._frame_to_pil(ds)
+            if jpeg is not None:
+                data, mime = jpeg, "image/jpeg"
+            else:
+                buf = io.BytesIO()
+                pil.save(buf, format="PNG")
+                data, mime = buf.getvalue(), "image/png"
+        except Exception as exc:
+            return {"success": False, "image_base64": "",
+                    "message": f"Could not decode image: {exc}",
+                    "sop_instance_uid": sop_instance_uid}
+
+        return {
+            "success": True,
+            "message": "Successfully retrieved image",
+            "sop_instance_uid": sop_instance_uid,
+            "mime_type": mime,
+            "image_base64": base64.b64encode(data).decode("ascii"),
+            "rows": int(ds.get("Rows", 0) or 0),
+            "columns": int(ds.get("Columns", 0) or 0),
+        }
+
     @staticmethod
     def _dataset_to_dict(dataset: Dataset) -> Dict[str, Any]:
         """Convert a DICOM dataset to a dictionary.
