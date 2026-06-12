@@ -7,7 +7,7 @@ abstracting the details of DICOM networking.
 import os
 import time
 import tempfile
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Optional
 
 from pydicom import dcmread
 from pydicom.dataset import Dataset
@@ -469,172 +469,187 @@ class DicomClient:
             assoc.release()
         
         return result
-    def extract_pdf_text_from_dicom(
-            self, 
+    def _retrieve_pdf_dataset(
+            self,
             study_instance_uid: str,
             series_instance_uid: str,
-            sop_instance_uid: str
-        ) -> Dict[str, Any]:
-        """Retrieve a DICOM instance with encapsulated PDF and extract its text content.
-        
-        This function retrieves a DICOM instance that contains an encapsulated PDF document
-        using C-GET and extracts the PDF content using PyPDF2 to parse the text content.
-        
-        Args:
-            study_instance_uid: Study Instance UID
-            series_instance_uid: Series Instance UID
-            sop_instance_uid: SOP Instance UID
-            
-        Returns:
-            Dictionary with extracted text information and status:
-            {
-                "success": bool,
-                "message": str,
-                "text_content": str,
-                "file_path": str  # Path to the temporary DICOM file
-            }
+            sop_instance_uid: str,
+        ) -> Tuple[Optional[Dataset], str, str]:
+        """C-GET a single Encapsulated PDF instance and validate it.
+
+        Shared retrieval path for the PDF tools (text extraction and widget rendering).
+
+        Returns a ``(dataset, message, file_path)`` tuple:
+          - success: ``(<PDF dataset>, "", <temp .dcm path>)``
+          - failure: ``(None, <human-readable reason>, <temp .dcm path or "">)``
+
+        The reason string differentiates the common failure modes (no instance matched /
+        stale UIDs, non-PDF instance that can't be transferred via the PDF-only role,
+        unreadable DICOM, wrong SOP class) so callers can surface it directly.
         """
         # Create temporary directory for storing retrieved files
         temp_dir = tempfile.mkdtemp()
-        
+
         # Create dataset for C-GET query
         ds = Dataset()
         ds.QueryRetrieveLevel = "IMAGE"
         ds.StudyInstanceUID = study_instance_uid
         ds.SeriesInstanceUID = series_instance_uid
         ds.SOPInstanceUID = sop_instance_uid
-        
-        # Define a handler for C-STORE operations during C-GET
+
+        # Collect instances pushed back to us via C-STORE during the C-GET.
         received_files = []
-        
+
         def handle_store(event):
             """Handle C-STORE operations during C-GET"""
             ds = event.dataset
             sop_instance = ds.SOPInstanceUID if hasattr(ds, 'SOPInstanceUID') else "unknown"
-            
+
             # Ensure we have file meta information
             if not hasattr(ds, 'file_meta') or not hasattr(ds.file_meta, 'TransferSyntaxUID'):
                 from pydicom.dataset import FileMetaDataset
                 if not hasattr(ds, 'file_meta'):
                     ds.file_meta = FileMetaDataset()
-                
+
                 if event.context.transfer_syntax:
                     ds.file_meta.TransferSyntaxUID = event.context.transfer_syntax
                 else:
                     ds.file_meta.TransferSyntaxUID = "1.2.840.10008.1.2.1"
-                
+
                 if not hasattr(ds.file_meta, 'MediaStorageSOPClassUID') and hasattr(ds, 'SOPClassUID'):
                     ds.file_meta.MediaStorageSOPClassUID = ds.SOPClassUID
-                
+
                 if not hasattr(ds.file_meta, 'MediaStorageSOPInstanceUID') and hasattr(ds, 'SOPInstanceUID'):
                     ds.file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
-            
+
             # Save the dataset to file
             file_path = os.path.join(temp_dir, f"{sop_instance}.dcm")
             ds.save_as(file_path, write_like_original=False)
             received_files.append(file_path)
-            
+
             return 0x0000  # Success
-        
-        # Define event handlers - using the proper format for pynetdicom
+
         handlers = [(evt.EVT_C_STORE, handle_store)]
-        
-        # Create an SCP/SCU Role Selection Negotiation item for PDF Storage
-        # This is needed to indicate our AE can act as an SCP (receiver) for C-STORE operations
-        # during the C-GET operation
+
+        # SCP/SCU Role Selection so our AE may act as the C-STORE receiver during C-GET.
+        # Only the Encapsulated PDF storage role is negotiated (see __init__ context).
         role = build_role(EncapsulatedPDFStorage, scp_role=True)
-        
-        # Associate with the DICOM node, providing the event handlers during association
-        # This is the correct way to handle events in pynetdicom
+
         assoc = self.ae.associate(
-            self.host, 
-            self.port, 
+            self.host,
+            self.port,
             ae_title=self.called_aet,
             evt_handlers=handlers,
-            ext_neg=[role]  # Add extended negotiation for SCP/SCU role selection
+            ext_neg=[role],
         )
-        
+
         if not assoc.is_established:
-            return {
-                "success": False,
-                "message": f"Failed to associate with DICOM node at {self.host}:{self.port}",
-                "text_content": "",
-                "file_path": ""
-            }
-        
-        success = False
+            return None, f"Failed to associate with DICOM node at {self.host}:{self.port}", ""
+
         message = "C-GET operation failed"
-        pdf_path = ""
-        extracted_text = ""
-        
+        final_status = None
         try:
-            # Send C-GET request - without evt_handlers parameter since we provided them during association
             responses = assoc.send_c_get(ds, PatientRootQueryRetrieveInformationModelGet)
-            
             for (status, dataset) in responses:
                 if status:
-                    status_int = status.Status if hasattr(status, 'Status') else 0
-                    
-                    if status_int == 0x0000:  # Success
-                        success = True
-                        message = "C-GET operation completed successfully"
-                    elif status_int == 0xFF00:  # Pending
-                        success = True  # Still processing
+                    final_status = status
+                    status_int = status.Status if hasattr(status, "Status") else None
+                    if status_int == 0xFF00:        # Pending - sub-operations running
                         message = "C-GET operation in progress"
+                    elif status_int == 0x0000:      # Final success
+                        message = "C-GET operation completed"
+                else:
+                    # An empty status means the peer aborted or the link timed out.
+                    message = ("C-GET failed: no response from the peer "
+                               "(association aborted or DIMSE timeout)")
+        except Exception as exc:
+            message = f"C-GET request raised an error: {exc}"
         finally:
-            # Always release the association
             assoc.release()
-        
-        # Process received files
-        if received_files:
-            dicom_file = received_files[0]
-            
-            # Read the DICOM file
-            ds = dcmread(dicom_file)
-            
-            # Check if it's an encapsulated PDF
-            if (hasattr(ds, 'SOPClassUID') and 
-                ds.SOPClassUID == '1.2.840.10008.5.1.4.1.1.104.1'):  # Encapsulated PDF Storage
-                
-                # Extract the PDF data
-                pdf_data = ds.EncapsulatedDocument
-                
-                # Write to a temporary file
-                pdf_path = os.path.join(temp_dir, "extracted.pdf")
-                with open(pdf_path, 'wb') as pdf_file:
-                    pdf_file.write(pdf_data)
-                
-                import PyPDF2
-                
-                # Extract text from the PDF
-                with open(pdf_path, 'rb') as pdf_file:
-                    pdf_reader = PyPDF2.PdfReader(pdf_file)
-                    text_parts = []
-                    
-                    # Extract text from each page
-                    for page_num in range(len(pdf_reader.pages)):
-                        page = pdf_reader.pages[page_num]
-                        text_parts.append(page.extract_text())
-                    
-                    extracted_text = "\n".join(text_parts)
-                
-                return {
-                    "success": True,
-                    "message": "Successfully extracted text from PDF in DICOM",
-                    "text_content": extracted_text,
-                    "file_path": dicom_file
-                }
+
+        # No instance came back: differentiate "nothing matched" (stale UIDs) from
+        # "matched but the transfer failed" (e.g. a non-PDF instance the PDF-only role
+        # can't carry), using the C-GET sub-operation counts.
+        if not received_files:
+            status_hex = (f"0x{final_status.Status:04x}"
+                          if final_status is not None and hasattr(final_status, "Status")
+                          else "n/a")
+            failed = getattr(final_status, "NumberOfFailedSuboperations", None)
+            if failed:
+                detail = (
+                    f"C-GET matched the instance but the transfer failed (final status "
+                    f"{status_hex}, {failed} failed sub-operation(s)). This tool only negotiates "
+                    f"the Encapsulated PDF storage role, so a non-PDF instance - e.g. a Structured "
+                    f"Report (SR) - cannot be retrieved with it. Verify the UIDs point to an "
+                    f"Encapsulated PDF instance."
+                )
             else:
-                message = "Retrieved DICOM instance does not contain an encapsulated PDF"
-                success = False
-        
+                detail = (
+                    f"C-GET returned no instances (final status {status_hex}). The requested UIDs "
+                    f"were not found on '{self.called_aet}' - they may be stale (data deleted or "
+                    f"re-imported). Re-run a query (C-FIND) to get current UIDs and try again."
+                )
+            return None, detail, ""
+
+        # Read the received instance back and verify it really is an Encapsulated PDF.
+        dicom_file = received_files[0]
+        try:
+            ds = dcmread(dicom_file)
+        except Exception as exc:
+            return None, f"Retrieved instance could not be read as DICOM: {exc}", dicom_file
+
+        if not (hasattr(ds, "SOPClassUID")
+                and ds.SOPClassUID == "1.2.840.10008.5.1.4.1.1.104.1"):
+            return None, (
+                "Retrieved DICOM instance is not an Encapsulated PDF "
+                f"(SOP Class: {getattr(ds, 'SOPClassUID', 'unknown')}). "
+                "A textual report may instead be stored as a Structured Report (SR)."
+            ), dicom_file
+
+        return ds, "", dicom_file
+
+    def extract_pdf_text_from_dicom(
+            self,
+            study_instance_uid: str,
+            series_instance_uid: str,
+            sop_instance_uid: str
+        ) -> Dict[str, Any]:
+        """Retrieve a DICOM-encapsulated PDF via C-GET and extract its text (PyPDF2).
+
+        Returns ``{success, message, text_content, file_path}``.
+        """
+        ds, error, dicom_file = self._retrieve_pdf_dataset(
+            study_instance_uid, series_instance_uid, sop_instance_uid)
+        if ds is None:
+            return {"success": False, "message": error,
+                    "text_content": "", "file_path": dicom_file}
+
+        # A malformed/truncated PDF (e.g. missing xref/startxref) makes PyPDF2 raise -
+        # catch it and report a clear cause rather than a raw traceback to the MCP client.
+        try:
+            pdf_data = ds.EncapsulatedDocument
+            import io
+            import PyPDF2
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_data))
+            extracted_text = "\n".join(page.extract_text() for page in pdf_reader.pages)
+        except Exception as exc:
+            return {
+                "success": False,
+                "message": (
+                    f"Instance retrieved, but the embedded PDF could not be parsed: {exc}. "
+                    "The encapsulated document may be malformed or truncated."
+                ),
+                "text_content": "",
+                "file_path": dicom_file,
+            }
+
         return {
-            "success": success,
-            "message": message,
+            "success": True,
+            "message": "Successfully extracted text from PDF in DICOM",
             "text_content": extracted_text,
-            "file_path": received_files[0] if received_files else ""
+            "file_path": dicom_file,
         }
-    
+
     @staticmethod
     def _dataset_to_dict(dataset: Dataset) -> Dict[str, Any]:
         """Convert a DICOM dataset to a dictionary.
@@ -657,7 +672,12 @@ class DicomClient:
                 # Handle regular elements
                 if hasattr(elem, "keyword"):
                     try:
-                        if elem.VM > 1:
+                        if elem.VR == "PN":
+                            # pydicom returns PersonName for PN elements, which is not
+                            # JSON-serializable -> the MCP framework's json.dumps() fails
+                            # downstream. Use the plain string form instead.
+                            result[elem.keyword] = str(elem.value)
+                        elif elem.VM > 1:
                             # Multiple values
                             result[elem.keyword] = list(elem.value)
                         else:
