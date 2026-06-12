@@ -22,7 +22,19 @@ def main():
     # stdio is launched directly by the MCP client and ignores them.
     mcp = create_dicom_mcp_server(args.config_path)
     if args.transport in ("http", "streamable-http", "sse"):
-        mcp.run(args.transport, host=args.host, port=args.port)
+        # stateless_http: treat every request independently (no session affinity). This makes
+        # the server survive restarts while the client stays up: when we restart this server
+        # but Claude + mcp-remote keep running, they must switch to the fresh server instance
+        # on the fly. With a stateful server the old session id is gone after the restart, so
+        # the reconnect fails with "server unreachable". Stateless binds nothing to a session,
+        # so the reconnect just works.
+        #
+        # Trade-off: stateless drops long-lived MCP session features (server->client
+        # notifications, resource subscriptions, per-session ctx state). This server uses none
+        # of them -- tools answer synchronously and the DICOM client lives in the server
+        # lifespan (app-wide, not session-bound), so it stays available across requests.
+        # Revisit only if a future tool needs streaming/progress over a persistent session.
+        mcp.run(args.transport, host=args.host, port=args.port, stateless_http=True)
     else:
         mcp.run(args.transport)
     
