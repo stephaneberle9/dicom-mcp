@@ -257,7 +257,7 @@ app.ontoolresult = async (result) => {
   let data;
   try {
     const res = await app.callServerTool({
-      name: "get_gallery_thumbnails",
+      name: "get_image_thumbnails",
       arguments: { study_instance_uid: STUDY, series_instance_uid: SERIES },
     });
     data = readToolData(res);
@@ -356,7 +356,7 @@ imgEl.addEventListener("click", async () => {
 app.ontoolresult = async (result) => {
   const meta = readToolData(result);
   if (!meta.success) { statusEl.textContent = meta.message || "No image."; return; }
-  // render_image_from_dicom gives us only the UIDs; pull the full image via a widget-side call
+  // render_single_image_from_dicom gives us only the UIDs; pull the full image via a widget-side call
   // so the base64 never enters the model's context.
   let d;
   try {
@@ -1049,12 +1049,12 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
 
         Use this when the user wants to *see* the endoscopy images. This places the
         ui://dicom/image-gallery.html widget and hands it the two UIDs; the widget then lazy-loads
-        the thumbnail grid itself via get_gallery_thumbnails (and the full image per thumbnail via
+        the thumbnail grid itself via get_image_thumbnails (and the full image per thumbnail via
         get_single_image). The thumbnails are fetched by the widget on purpose, so the base64 never
         enters the model's context.
 
         IMPORTANT: once this returns, the images are ALREADY shown to the user in the gallery
-        widget. Do NOT call any further tool (visualization/artifact/code tools, get_gallery_thumbnails
+        widget. Do NOT call any further tool (visualization/artifact/code tools, get_image_thumbnails
         or get_single_image) to show, render or save them, and do not describe their contents unless
         asked - just briefly confirm. Only act further if the user explicitly asks.
 
@@ -1066,7 +1066,7 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
             series_instance_uid: Series Instance UID
         """
         # Return ONLY the UIDs (no base64) so nothing heavy reaches the model - the widget pulls
-        # the thumbnail grid via get_gallery_thumbnails, a widget-side call that stays out of the
+        # the thumbnail grid via get_image_thumbnails, a widget-side call that stays out of the
         # model's context. (Claude Desktop surfaces structured_content to the model.)
         data = {
             "success": True,
@@ -1079,7 +1079,7 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
         return ToolResult(content=summary, structured_content=data)
 
     @mcp.tool()
-    def get_gallery_thumbnails(
+    def get_image_thumbnails(
         study_instance_uid: str,
         series_instance_uid: str,
         ctx: Context = None,
@@ -1133,7 +1133,7 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
 
     # --- Download / save-to-disk tools ------------------------------------------
     @mcp.tool()
-    def save_pdf_report(
+    def save_pdf_from_dicom(
         study_instance_uid: str,
         series_instance_uid: str,
         sop_instance_uid: str,
@@ -1163,7 +1163,7 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
         )
 
     @mcp.tool()
-    def save_images(
+    def save_images_from_dicom(
         study_instance_uid: str,
         series_instance_uid: str,
         destination: str,
@@ -1206,7 +1206,7 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
 
     # --- Single-image viewer widget ---------------------------------------------
     @mcp.tool(app=AppConfig(resource_uri="ui://dicom/single-image.html"))
-    def render_image_from_dicom(
+    def render_single_image_from_dicom(
         study_instance_uid: str,
         series_instance_uid: str,
         sop_instance_uid: str,
@@ -1248,7 +1248,7 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
         app=AppConfig(csp=ResourceCSP(resource_domains=["https://unpkg.com"])),
     )
     def single_image_widget() -> str:
-        """HTML for the render_image_from_dicom single-image viewer UI."""
+        """HTML for the render_single_image_from_dicom single-image viewer UI."""
         return SINGLE_IMAGE_WIDGET_HTML
 
     return mcp
