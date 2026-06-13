@@ -55,9 +55,9 @@ PDF_VIEW_WIDGET_HTML = """<!doctype html>
 </style></head>
 <body>
   <div class="bar">
-    <h1>📄 DICOM-Bericht (Encapsulated PDF)</h1>
+    <h1>📄 DICOM Report (Encapsulated PDF)</h1>
   </div>
-  <div id="status">Lade PDF &hellip;</div>
+  <div id="status">Loading PDF &hellip;</div>
   <div id="pages"></div>
   <pre id="fallback" class="hidden"></pre>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"
@@ -85,16 +85,16 @@ function showFallback(text, note) {
   pagesEl.classList.add("hidden");
   fbEl.classList.remove("hidden");
   fbEl.textContent = text || "(kein Text extrahierbar)";
-  statusEl.textContent = note || "PDF-Vorschau nicht verfügbar – Textfassung:";
+  statusEl.textContent = note || "PDF preview unavailable – text version:";
 }
 
 async function renderPdf(bytes) {
   const pdfjsLib = window.pdfjsLib;
-  if (!pdfjsLib) throw new Error("pdf.js nicht geladen (CSP?)");
+  if (!pdfjsLib) throw new Error("pdf.js not loaded (CSP?)");
   pdfjsLib.GlobalWorkerOptions.workerSrc =
     "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
   const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
-  statusEl.textContent = pdf.numPages + " Seite(n)";
+  statusEl.textContent = pdf.numPages + " page(s)";
   for (let n = 1; n <= pdf.numPages; n++) {
     const page = await pdf.getPage(n);
     const viewport = page.getViewport({ scale: 1.5 });
@@ -108,22 +108,44 @@ async function renderPdf(bytes) {
 const app = new App({ name: "DicomPdfView", version: "1.0.0" });
 app.ontoolresult = async (result) => {
   const data = readToolData(result);
-  if (!data.success || !data.pdf_base64) {
-    showFallback(data.text_content, data.message || "PDF konnte nicht geladen werden.");
+  if (!data.success) { showFallback("", data.message || "Could not load the PDF."); return; }
+  // render_pdf_from_dicom hands us only the UIDs; pull the heavy payload (base64 + text) via a
+  // widget-side tool call so it never enters the model's context.
+  let payload;
+  try {
+    const res = await app.callServerTool({
+      name: "get_pdf_payload",
+      arguments: { study_instance_uid: data.study_instance_uid,
+                   series_instance_uid: data.series_instance_uid,
+                   sop_instance_uid: data.sop_instance_uid },
+    });
+    payload = readToolData(res);
+  } catch (e) {
+    showFallback("", "Could not fetch the PDF (" + e + ")");
+    return;
+  }
+  if (!payload.success || !payload.pdf_base64) {
+    showFallback(payload.text_content, payload.message || "Could not load the PDF.");
     return;
   }
   try {
-    await renderPdf(b64ToBytes(data.pdf_base64));
+    await renderPdf(b64ToBytes(payload.pdf_base64));
   } catch (e) {
-    showFallback(data.text_content, "PDF-Rendering fehlgeschlagen (" + e + ") – Textfassung:");
+    showFallback(payload.text_content, "PDF rendering failed (" + e + ") – text version:");
   }
 };
 
 await app.connect();
 const ctx = app.getHostContext?.();
 if (ctx?.theme === "dark") document.documentElement.classList.add("dark");
-app.onhostcontextchanged = (c) =>
-  document.documentElement.classList.toggle("dark", c?.theme === "dark");
+app.onhostcontextchanged = (c) => {
+  // Partial update: only act on fields actually present (a theme-only update must not flip mode,
+  // a mode-only update must not flip the theme).
+  if (c?.theme) document.documentElement.classList.toggle("dark", c.theme === "dark");
+  // Gallery only: host left fullscreen (e.g. user hit the host's close-X) -> tear the lightbox
+  // down so we land back on the thumbnail grid instead of a stuck single-image view.
+  if (c?.displayMode && c.displayMode !== "fullscreen" && typeof resetView === "function") resetView();
+};
 </script>
 </body>
 </html>
@@ -155,15 +177,16 @@ IMAGE_GALLERY_WIDGET_HTML = """<!doctype html>
         align-items: center; justify-content: center; cursor: zoom-out; padding: 16px; }
   #lb.open { display: flex; }
   #lb img { max-width: 100%; max-height: 100%; object-fit: contain; }
-  #lbstatus { position: absolute; bottom: 14px; left: 0; right: 0; text-align: center;
-              color: #fff; font-size: 13px; }
+  #lbstatus { position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%);
+              color: #fff; font-size: 14px; background: rgba(0,0,0,.62); padding: 7px 16px;
+              border-radius: 999px; pointer-events: none; white-space: nowrap; }
   /* While a full image is shown (esp. in fullscreen) hide the grid so only the image shows. */
   body.viewing h1, body.viewing #status, body.viewing #grid { display: none; }
   #lb.open { min-height: 100vh; }
 </style></head>
 <body>
-  <h1>🩺 Endoskopie-Bilder</h1>
-  <div id="status">Lade Bilder &hellip;</div>
+  <h1>🩺 Endoscopy Images</h1>
+  <div id="status">Loading images &hellip;</div>
   <div id="grid"></div>
   <div id="lb"><img id="lbimg" alt=""><div id="lbstatus"></div></div>
 <script type="module">
@@ -180,10 +203,15 @@ const grid = document.getElementById("grid");
 const lb = document.getElementById("lb");
 const lbimg = document.getElementById("lbimg");
 const lbStatus = document.getElementById("lbstatus");
-lb.addEventListener("click", () => {
+// DOM teardown only (no display-mode request) so it is safe to call both when WE close the
+// lightbox and when the HOST closes fullscreen via its own chrome.
+function resetView() {
   lb.classList.remove("open");
   document.body.classList.remove("viewing");
-  requestMode("inline");
+}
+lb.addEventListener("click", () => {
+  resetView();
+  requestMode("inline");   // we initiated the close -> ask the host to shrink back to inline
 });
 
 const app = new App({ name: "DicomImageGallery", version: "1.0.0" });
@@ -198,7 +226,9 @@ async function openFull(sop, thumbSrc) {
   await requestMode("fullscreen");      // so the full image isn't capped by the inline widget size
   document.body.classList.add("viewing");  // hide the thumbnail grid behind the full image
   lbimg.src = thumbSrc;                 // show the thumbnail immediately while the full loads
-  lbStatus.textContent = "Lade Vollbild …";
+  // Steer the user to close by clicking the image (smooth API exit, no chat scroll jump) rather
+  // than the host's fullscreen close-X (which causes a one-time scroll jump on first exit).
+  lbStatus.textContent = "Loading full image … · click the image to close";
   lb.classList.add("open");
   try {
     const res = await app.callServerTool({
@@ -208,25 +238,39 @@ async function openFull(sop, thumbSrc) {
     const d = readToolData(res);
     if (d.image_base64) {
       lbimg.src = "data:" + (d.mime_type || "image/jpeg") + ";base64," + d.image_base64;
-      lbStatus.textContent = "Klick zum Schließen";
+      lbStatus.textContent = "Click the image to close";
     } else {
-      lbStatus.textContent = d.message || "Vollbild nicht verfügbar";
+      lbStatus.textContent = d.message || "Full image unavailable";
     }
   } catch (e) {
-    lbStatus.textContent = "Fehler beim Laden (" + e + ")";
+    lbStatus.textContent = "Load error (" + e + ")";
   }
 }
 
-app.ontoolresult = (result) => {
-  const data = readToolData(result);
-  STUDY = data.study_instance_uid || "";
-  SERIES = data.series_instance_uid || "";
-  const images = (data.images || []).filter(im => im.image_base64);
-  if (!data.success || images.length === 0) {
-    statusEl.textContent = data.message || "Keine Bilder gefunden.";
+app.ontoolresult = async (result) => {
+  const meta = readToolData(result);
+  STUDY = meta.study_instance_uid || "";
+  SERIES = meta.series_instance_uid || "";
+  if (!meta.success) { statusEl.textContent = meta.message || "No images found."; return; }
+  // render_images_from_dicom gives us only the UIDs; pull the thumbnail grid via a widget-side
+  // call so the base64 never enters the model's context.
+  let data;
+  try {
+    const res = await app.callServerTool({
+      name: "get_gallery_thumbnails",
+      arguments: { study_instance_uid: STUDY, series_instance_uid: SERIES },
+    });
+    data = readToolData(res);
+  } catch (e) {
+    statusEl.textContent = "Could not load images (" + e + ")";
     return;
   }
-  statusEl.textContent = images.length + " Bild(er) – zum Vergrößern anklicken";
+  const images = (data.images || []).filter(im => im.image_base64);
+  if (!data.success || images.length === 0) {
+    statusEl.textContent = data.message || "No images found.";
+    return;
+  }
+  statusEl.textContent = images.length + " image(s) – click to enlarge";
   grid.innerHTML = "";
   for (const im of images) {
     const src = "data:" + (im.mime_type || "image/jpeg") + ";base64," + im.image_base64;
@@ -244,8 +288,103 @@ app.ontoolresult = (result) => {
 await app.connect();
 const ctx = app.getHostContext?.();
 if (ctx?.theme === "dark") document.documentElement.classList.add("dark");
-app.onhostcontextchanged = (c) =>
-  document.documentElement.classList.toggle("dark", c?.theme === "dark");
+app.onhostcontextchanged = (c) => {
+  // Partial update: only act on fields actually present (a theme-only update must not flip mode,
+  // a mode-only update must not flip the theme).
+  if (c?.theme) document.documentElement.classList.toggle("dark", c.theme === "dark");
+  // Gallery only: host left fullscreen (e.g. user hit the host's close-X) -> tear the lightbox
+  // down so we land back on the thumbnail grid instead of a stuck single-image view.
+  if (c?.displayMode && c.displayMode !== "fullscreen" && typeof resetView === "function") resetView();
+};
+</script>
+</body>
+</html>
+"""
+
+
+# Single-image viewer: shows ONE full-resolution image inline, click to toggle fullscreen.
+# Mirrors the gallery lightbox but as the primary view; lazy-loads the image via get_single_image.
+SINGLE_IMAGE_WIDGET_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><style>
+  :root { color-scheme: light dark; }
+  body { font: 14px system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 12px;
+         color: #1a1a1a; }
+  html.dark body { color: #e8e8e8; }
+  h1 { font-size: 15px; margin: 0 0 4px; }
+  #status { color: #666; font-size: 13px; margin-bottom: 8px; }
+  html.dark #status { color: #aaa; }
+  #img { max-width: 100%; height: auto; border-radius: 6px; display: block; cursor: zoom-in; }
+  /* Fullscreen: image fills the viewport on a black backdrop; chrome hidden. */
+  body.fs { background: #000; padding: 0; }
+  body.fs h1, body.fs #status { display: none; }
+  body.fs #img { position: fixed; inset: 0; margin: auto; max-width: 100vw; max-height: 100vh;
+                 width: auto; height: auto; object-fit: contain; cursor: zoom-out; border-radius: 0; }
+  #hint { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); color: #fff;
+          background: rgba(0,0,0,.62); padding: 7px 16px; border-radius: 999px; font-size: 14px;
+          display: none; pointer-events: none; white-space: nowrap; }
+  body.fs #hint { display: block; }
+</style></head>
+<body>
+  <h1>🩺 Endoscopy Image</h1>
+  <div id="status">Loading image &hellip;</div>
+  <img id="img" alt="">
+  <div id="hint">Click the image to close</div>
+<script type="module">
+import { App } from "https://unpkg.com/@modelcontextprotocol/ext-apps@0.4.0/app-with-deps";
+
+function readToolData(result) {
+  if (result && result.structuredContent && typeof result.structuredContent === "object")
+    return result.structuredContent;
+  const t = (result?.content || []).find(c => c.type === "text");
+  try { return JSON.parse(t?.text || "{}"); } catch (e) { return {}; }
+}
+const statusEl = document.getElementById("status");
+const imgEl = document.getElementById("img");
+
+const app = new App({ name: "DicomSingleImage", version: "1.0.0" });
+let fs = false;
+async function requestMode(mode) {
+  try { await app.requestDisplayMode({ mode }); } catch (e) { /* host may not support it */ }
+}
+function exitFs() { if (fs) { fs = false; document.body.classList.remove("fs"); } }
+
+imgEl.addEventListener("click", async () => {
+  if (!fs) { fs = true; document.body.classList.add("fs"); await requestMode("fullscreen"); }
+  else { exitFs(); await requestMode("inline"); }   // smooth API exit (no chat scroll jump)
+});
+
+app.ontoolresult = async (result) => {
+  const meta = readToolData(result);
+  if (!meta.success) { statusEl.textContent = meta.message || "No image."; return; }
+  // render_image_from_dicom gives us only the UIDs; pull the full image via a widget-side call
+  // so the base64 never enters the model's context.
+  let d;
+  try {
+    const res = await app.callServerTool({
+      name: "get_single_image",
+      arguments: { study_instance_uid: meta.study_instance_uid,
+                   series_instance_uid: meta.series_instance_uid,
+                   sop_instance_uid: meta.sop_instance_uid },
+    });
+    d = readToolData(res);
+  } catch (e) {
+    statusEl.textContent = "Could not load image (" + e + ")";
+    return;
+  }
+  if (!d.image_base64) { statusEl.textContent = d.message || "Image unavailable"; return; }
+  imgEl.src = "data:" + (d.mime_type || "image/jpeg") + ";base64," + d.image_base64;
+  const dim = (d.columns && d.rows) ? "  (" + d.columns + "\\u00d7" + d.rows + ")" : "";
+  statusEl.textContent = "Click the image to enlarge" + dim;
+};
+
+await app.connect();
+const ctx = app.getHostContext?.();
+if (ctx?.theme === "dark") document.documentElement.classList.add("dark");
+app.onhostcontextchanged = (c) => {
+  if (c?.theme) document.documentElement.classList.toggle("dark", c.theme === "dark");
+  // Host left fullscreen (e.g. user hit the host's close-X) -> drop back to the inline view.
+  if (c?.displayMode && c.displayMode !== "fullscreen") exitFs();
+};
 </script>
 </body>
 </html>
@@ -819,13 +958,17 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
         series_instance_uid: str,
         sop_instance_uid: str,
         ctx: Context = None,
-    ) -> Dict[str, Any]:
-        """Retrieve a DICOM-encapsulated PDF report and render it inline (PDF viewer).
+    ) -> ToolResult:
+        """Render a DICOM-encapsulated PDF report inline (PDF viewer widget).
 
-        Use this when the user wants to *see* the report, not just read its text. Retrieves
-        the Encapsulated PDF instance via C-GET and returns it base64-encoded so the
-        ui://dicom/pdf-view.html widget renders the pages with pdf.js. Also returns the
-        extracted text as a fallback for hosts that don't render widgets.
+        Use this when the user wants to *see* the report, not just read its text. This places the
+        ui://dicom/pdf-view.html widget and hands it the three UIDs; the widget then lazy-loads the
+        PDF bytes + extracted text itself via get_pdf_payload and renders the pages with pdf.js.
+        The heavy payload (base64 + text) is fetched by the widget on purpose, so it never enters
+        the model's context - for plain report text use extract_pdf_text_from_dicom instead.
+
+        IMPORTANT: once this returns, the report is ALREADY shown to the user in the widget. Do not
+        reproduce the report text, save it to a file, or call other tools - just briefly confirm.
 
         Get the three UIDs from a query first (query_studies -> query_series ->
         query_instances); the target must be an Encapsulated PDF instance.
@@ -834,17 +977,55 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
             study_instance_uid: Study Instance UID
             series_instance_uid: Series Instance UID
             sop_instance_uid: SOP Instance UID
+        """
+        # Return ONLY the UIDs (no base64/text/file_path) so nothing tempting reaches the model -
+        # the widget pulls the payload via get_pdf_payload, a widget-side call that stays out of
+        # the model's context. (Claude Desktop surfaces structured_content to the model, so heavy
+        # fields placed here would otherwise be reprinted/saved by the model.)
+        data = {
+            "success": True,
+            "study_instance_uid": study_instance_uid,
+            "series_instance_uid": series_instance_uid,
+            "sop_instance_uid": sop_instance_uid,
+        }
+        summary = ("PDF report is NOW rendered inline for the user in the PDF viewer widget. Reply "
+                   "with a brief, user-facing confirmation only; do NOT reproduce the report text, "
+                   "save it to a file, or call other tools - the widget already shows it.")
+        return ToolResult(content=summary, structured_content=data)
 
-        Returns:
-            Dictionary: { success, message, pdf_base64, size_bytes, text_content, file_path }
+    @mcp.tool()
+    def get_pdf_payload(
+        study_instance_uid: str,
+        series_instance_uid: str,
+        sop_instance_uid: str,
+        ctx: Context = None,
+    ) -> ToolResult:
+        """Retrieve the PDF bytes + extracted text for the PDF viewer widget (widget-internal).
+
+        Called by the ui://dicom/pdf-view.html widget via callServerTool to lazy-load the report
+        payload after render_pdf_from_dicom has placed the widget. Do NOT call this directly - to
+        show a report use render_pdf_from_dicom, to read its text use extract_pdf_text_from_dicom.
+
+        Args:
+            study_instance_uid: Study Instance UID
+            series_instance_uid: Series Instance UID
+            sop_instance_uid: SOP Instance UID of the Encapsulated PDF instance
         """
         dicom_ctx = ctx.request_context.lifespan_context
         client: DicomClient = dicom_ctx.client
-        return client.get_pdf_from_dicom(
+        data = client.get_pdf_from_dicom(
             study_instance_uid=study_instance_uid,
             series_instance_uid=series_instance_uid,
             sop_instance_uid=sop_instance_uid,
         )
+        payload = {
+            "success": data.get("success", False),
+            "message": data.get("message", ""),
+            "pdf_base64": data.get("pdf_base64", ""),
+            "text_content": data.get("text_content", ""),
+        }
+        return ToolResult(content="(PDF payload delivered to the widget.)",
+                          structured_content=payload)
 
     @mcp.resource(
         "ui://dicom/pdf-view.html",
@@ -864,15 +1045,50 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
         series_instance_uid: str,
         ctx: Context = None,
     ) -> ToolResult:
-        """Retrieve the VL Endoscopic Images of a series and show them as an inline gallery.
+        """Show the VL Endoscopic Images of a series as an inline gallery (gallery widget).
 
-        Use this when the user wants to *see* the endoscopy images. Retrieves every image of
-        the series via C-GET, downscales them to thumbnails, and shows them in the
-        ui://dicom/image-gallery.html widget (thumbnail grid + click-to-enlarge lightbox that
-        lazy-loads the full image via get_single_image).
+        Use this when the user wants to *see* the endoscopy images. This places the
+        ui://dicom/image-gallery.html widget and hands it the two UIDs; the widget then lazy-loads
+        the thumbnail grid itself via get_gallery_thumbnails (and the full image per thumbnail via
+        get_single_image). The thumbnails are fetched by the widget on purpose, so the base64 never
+        enters the model's context.
+
+        IMPORTANT: once this returns, the images are ALREADY shown to the user in the gallery
+        widget. Do NOT call any further tool (visualization/artifact/code tools, get_gallery_thumbnails
+        or get_single_image) to show, render or save them, and do not describe their contents unless
+        asked - just briefly confirm. Only act further if the user explicitly asks.
 
         Get the UIDs from a query first (query_studies -> query_series); point at the image
         series (Modality ES / VL Endoscopic Image), not the report (SR/PDF) series.
+
+        Args:
+            study_instance_uid: Study Instance UID
+            series_instance_uid: Series Instance UID
+        """
+        # Return ONLY the UIDs (no base64) so nothing heavy reaches the model - the widget pulls
+        # the thumbnail grid via get_gallery_thumbnails, a widget-side call that stays out of the
+        # model's context. (Claude Desktop surfaces structured_content to the model.)
+        data = {
+            "success": True,
+            "study_instance_uid": study_instance_uid,
+            "series_instance_uid": series_instance_uid,
+        }
+        summary = ("The endoscopy images of the series are NOW displayed to the user inline in the "
+                   "gallery widget. Reply with a brief, user-facing confirmation only; do NOT save "
+                   "them to files or call other tools - the widget already shows them.")
+        return ToolResult(content=summary, structured_content=data)
+
+    @mcp.tool()
+    def get_gallery_thumbnails(
+        study_instance_uid: str,
+        series_instance_uid: str,
+        ctx: Context = None,
+    ) -> ToolResult:
+        """Retrieve downscaled thumbnails of a series for the gallery widget (widget-internal).
+
+        Called by the ui://dicom/image-gallery.html widget via callServerTool to lazy-load the
+        thumbnail grid after render_images_from_dicom has placed the widget. Do NOT call this
+        directly - to show images use render_images_from_dicom.
 
         Args:
             study_instance_uid: Study Instance UID
@@ -884,11 +1100,7 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
             study_instance_uid=study_instance_uid,
             series_instance_uid=series_instance_uid,
         )
-        # Keep the base64 thumbnails out of the model's context (a full gallery can exceed
-        # the tool-result size limit) - the widget reads them from structured_content.
-        summary = (f"Retrieved {data.get('count', 0)} endoscopy image(s); shown in the gallery widget."
-                   if data.get("success") else data.get("message", "No images."))
-        return ToolResult(content=summary, structured_content=data)
+        return ToolResult(content="(thumbnails delivered to the widget.)", structured_content=data)
 
     @mcp.tool()
     def get_single_image(
@@ -919,6 +1131,71 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
                    else data.get("message", "No image."))
         return ToolResult(content=summary, structured_content=data)
 
+    # --- Download / save-to-disk tools ------------------------------------------
+    @mcp.tool()
+    def save_pdf_report(
+        study_instance_uid: str,
+        series_instance_uid: str,
+        sop_instance_uid: str,
+        destination: str,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        """Download a DICOM-encapsulated PDF report to a local file.
+
+        Use ONLY when the user explicitly asks to save/download the report. C-GETs the Encapsulated
+        PDF instance and writes the PDF bytes to disk on the machine running this server (the user's
+        machine). `destination` may be a target .pdf path or an existing directory (then a filename
+        is derived from PatientID/StudyDate). `~` and environment variables are expanded.
+
+        Args:
+            study_instance_uid: Study Instance UID
+            series_instance_uid: Series Instance UID
+            sop_instance_uid: SOP Instance UID of the Encapsulated PDF instance
+            destination: target file path or directory (e.g. "~/Downloads" or "~/Downloads/report.pdf")
+        """
+        dicom_ctx = ctx.request_context.lifespan_context
+        client: DicomClient = dicom_ctx.client
+        return client.save_pdf(
+            study_instance_uid=study_instance_uid,
+            series_instance_uid=series_instance_uid,
+            sop_instance_uid=sop_instance_uid,
+            destination=destination,
+        )
+
+    @mcp.tool()
+    def save_images(
+        study_instance_uid: str,
+        series_instance_uid: str,
+        destination: str,
+        sop_instance_uid: str = None,
+        ctx: Context = None,
+    ) -> Dict[str, Any]:
+        """Download endoscopy image(s) of a series to local files (original quality).
+
+        Use ONLY when the user explicitly asks to save/download image(s). C-GETs the VL Endoscopic
+        Image(s) and writes the original JPEG bitstream where available (lossless), else PNG, on the
+        machine running this server (the user's machine). `~` and environment variables are expanded.
+
+        - Whole series: omit sop_instance_uid; `destination` is a directory, files are named
+          image_01.jpg, image_02.jpg, ...
+        - Single image: pass sop_instance_uid; `destination` may be a directory or an explicit file
+          path.
+
+        Args:
+            study_instance_uid: Study Instance UID
+            series_instance_uid: Series Instance UID
+            destination: target directory (whole series) or directory/file path (single image)
+            sop_instance_uid: SOP Instance UID of one image to save; omit to save the whole series
+        """
+        dicom_ctx = ctx.request_context.lifespan_context
+        client: DicomClient = dicom_ctx.client
+        return client.save_images(
+            study_instance_uid=study_instance_uid,
+            series_instance_uid=series_instance_uid,
+            destination=destination,
+            sop_instance_uid=sop_instance_uid,
+        )
+
     @mcp.resource(
         "ui://dicom/image-gallery.html",
         app=AppConfig(csp=ResourceCSP(resource_domains=["https://unpkg.com"])),
@@ -926,5 +1203,52 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
     def image_gallery_widget() -> str:
         """HTML for the render_images_from_dicom gallery UI."""
         return IMAGE_GALLERY_WIDGET_HTML
+
+    # --- Single-image viewer widget ---------------------------------------------
+    @mcp.tool(app=AppConfig(resource_uri="ui://dicom/single-image.html"))
+    def render_image_from_dicom(
+        study_instance_uid: str,
+        series_instance_uid: str,
+        sop_instance_uid: str,
+        ctx: Context = None,
+    ) -> ToolResult:
+        """Show ONE endoscopy image large inline (single-image viewer widget).
+
+        Use this when the user wants to *see* a single specific image (not the whole series). This
+        places the ui://dicom/single-image.html widget and hands it the three UIDs; the widget then
+        lazy-loads the full-resolution image itself via get_single_image and shows it (click to
+        toggle fullscreen). The base64 is fetched by the widget on purpose, so it never enters the
+        model's context. For the whole series use render_images_from_dicom.
+
+        IMPORTANT: once this returns, the image is ALREADY shown to the user in the widget. Do not
+        save it to a file, describe its contents unless asked, or call other tools - just briefly
+        confirm.
+
+        Get the three UIDs from a query first (query_studies -> query_series -> query_instances);
+        the target must be a VL Endoscopic Image instance.
+
+        Args:
+            study_instance_uid: Study Instance UID
+            series_instance_uid: Series Instance UID
+            sop_instance_uid: SOP Instance UID of the image to show
+        """
+        data = {
+            "success": True,
+            "study_instance_uid": study_instance_uid,
+            "series_instance_uid": series_instance_uid,
+            "sop_instance_uid": sop_instance_uid,
+        }
+        summary = ("The endoscopy image is NOW displayed to the user inline in the image viewer "
+                   "widget. Reply with a brief, user-facing confirmation only; do NOT save it to a "
+                   "file or call other tools - the widget already shows it.")
+        return ToolResult(content=summary, structured_content=data)
+
+    @mcp.resource(
+        "ui://dicom/single-image.html",
+        app=AppConfig(csp=ResourceCSP(resource_domains=["https://unpkg.com"])),
+    )
+    def single_image_widget() -> str:
+        """HTML for the render_image_from_dicom single-image viewer UI."""
+        return SINGLE_IMAGE_WIDGET_HTML
 
     return mcp
