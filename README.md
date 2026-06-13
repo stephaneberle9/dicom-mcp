@@ -80,7 +80,13 @@ nodes:
 
 current_node: "main"
 calling_aet: "MCPSCU" 
+
+# Optional: directory the save tools write to (default: ~/Downloads)
+output_dir: "~/Downloads"
 ```
+
+`output_dir` confines the tools that save PDF reports and images to disk: they write only inside this directory (`~` and environment variables are expanded), take a relative destination as relative to it, refuse destinations outside it, and never overwrite existing files.
+
 > [!WARNING]
 DICOM-MCP is not meant for clinical use, and should not be connected with live hospital databases or databases with patient-sensitive data. Doing so could lead to both loss of patient data, and leakage of patient data onto the internet. DICOM-MCP can be used with locally hosted open-weight LLMs for complete data privacy. 
 

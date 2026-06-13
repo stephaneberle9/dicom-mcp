@@ -21,6 +21,8 @@ class DicomConfiguration(BaseModel):
     nodes: Dict[str, DicomNodeConfig]
     current_node: str
     calling_aet: str
+    # The save tools write only below this directory (`~` and environment variables expand).
+    output_dir: str = "~/Downloads"
 
 def load_config(config_path: str) -> DicomConfiguration:
     """Load DICOM configuration from YAML file.
