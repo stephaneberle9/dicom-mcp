@@ -769,6 +769,20 @@ class DicomClient:
         return received, None
 
     @staticmethod
+    def _encapsulated_first_frame(pixel_data, number_of_frames):
+        """Return the first encapsulated frame's bytes, across pydicom 2.x/3.x API names.
+
+        pydicom 3.x exposes ``generate_frames``; pydicom 2.x only has
+        ``generate_pixel_data_frame`` (``generate_frames`` is absent and importing it raises).
+        """
+        try:                                   # pydicom 3.x (and late 2.x)
+            from pydicom.encaps import generate_frames
+            return next(generate_frames(pixel_data, number_of_frames=number_of_frames))
+        except ImportError:                    # pydicom 2.x
+            from pydicom.encaps import generate_pixel_data_frame
+            return next(generate_pixel_data_frame(pixel_data, number_of_frames))
+
+    @staticmethod
     def _frame_to_pil(ds):
         """Decode one frame of a (possibly JPEG-encapsulated) image to a PIL RGB image.
 
@@ -780,9 +794,8 @@ class DicomClient:
         from PIL import Image
         ts = ds.file_meta.TransferSyntaxUID
         if ts.is_encapsulated:
-            from pydicom.encaps import generate_frames
             n = int(ds.get("NumberOfFrames", 1) or 1)
-            jpeg = next(generate_frames(ds.PixelData, number_of_frames=n)).rstrip(b"\x00")
+            jpeg = DicomClient._encapsulated_first_frame(ds.PixelData, n).rstrip(b"\x00")
             return Image.open(io.BytesIO(jpeg)).convert("RGB"), jpeg
         return Image.fromarray(ds.pixel_array).convert("RGB"), None
 
@@ -876,6 +889,99 @@ class DicomClient:
             "rows": int(ds.get("Rows", 0) or 0),
             "columns": int(ds.get("Columns", 0) or 0),
         }
+
+    def save_pdf(self, study_instance_uid, series_instance_uid, sop_instance_uid,
+                 destination) -> Dict[str, Any]:
+        """C-GET an Encapsulated PDF and write it to a local file.
+
+        ``destination`` may be a target file or an existing directory (then a name is derived
+        from PatientID/StudyDate). Returns ``{success, message, file_path, size_bytes}``.
+        """
+        import os
+
+        ds, error, _ = self._retrieve_pdf_dataset(
+            study_instance_uid, series_instance_uid, sop_instance_uid)
+        if ds is None:
+            return {"success": False, "message": error, "file_path": ""}
+        try:
+            pdf_data = bytes(ds.EncapsulatedDocument)
+        except Exception as exc:
+            return {"success": False, "file_path": "",
+                    "message": f"Instance retrieved, but the embedded PDF could not be read: {exc}."}
+
+        dest = os.path.expandvars(os.path.expanduser(destination))
+        if os.path.isdir(dest):
+            # The filename is derived from DICOM tags, which are controlled by the sending device.
+            # Sanitize to a bare filename (whitelist + basename, no leading dots) so a crafted
+            # PatientID like "..\\..\\evil" cannot traverse out of the destination directory.
+            import re
+            pid = str(ds.get("PatientID", "") or "").strip()
+            sd = str(ds.get("StudyDate", "") or "").strip()
+            stem = re.sub(r"[^A-Za-z0-9._-]", "_", f"{pid}_{sd}" if sd else pid)
+            stem = os.path.basename(stem).lstrip(".") or "report"
+            path = os.path.join(dest, stem + ".pdf")
+        else:
+            path = dest if dest.lower().endswith(".pdf") else dest + ".pdf"
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        try:
+            with open(path, "wb") as fh:
+                fh.write(pdf_data)
+        except OSError as exc:
+            return {"success": False, "file_path": path, "message": f"Could not write file: {exc}"}
+        return {"success": True, "file_path": os.path.abspath(path), "size_bytes": len(pdf_data),
+                "message": f"PDF saved to {os.path.abspath(path)}"}
+
+    def save_images(self, study_instance_uid, series_instance_uid, destination,
+                    sop_instance_uid=None) -> Dict[str, Any]:
+        """C-GET VL Endoscopic Image(s) and write them to disk as original-quality files.
+
+        With ``sop_instance_uid`` only that one image is saved (``destination`` may be a file or a
+        directory); without it the whole series is saved into the directory ``destination``. The
+        original JPEG bitstream is written where available (lossless), else a PNG. Returns
+        ``{success, count, message, files}``.
+        """
+        import io
+        import os
+
+        received, error = self._c_get_image_datasets(
+            study_instance_uid, series_instance_uid, sop_instance_uid)
+        if error:
+            return {"success": False, "count": 0, "files": [], "message": error}
+
+        dest = os.path.expandvars(os.path.expanduser(destination))
+        single = sop_instance_uid is not None
+        # A single image may target an explicit file path; everything else goes into a directory.
+        file_target = single and os.path.splitext(dest)[1] != "" and not os.path.isdir(dest)
+        if file_target:
+            os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        else:
+            os.makedirs(dest, exist_ok=True)
+
+        files = []
+        for ds in received:
+            try:
+                pil, jpeg = self._frame_to_pil(ds)
+                if jpeg is not None:
+                    data, ext = jpeg, ".jpg"
+                else:
+                    buf = io.BytesIO()
+                    pil.save(buf, format="PNG")
+                    data, ext = buf.getvalue(), ".png"
+            except Exception as exc:
+                return {"success": False, "count": len(files), "files": files,
+                        "message": f"Could not decode an image: {exc}"}
+            inst = int(ds.get("InstanceNumber", 0) or 0)
+            path = dest if file_target else os.path.join(dest, f"image_{inst:02d}{ext}")
+            try:
+                with open(path, "wb") as fh:
+                    fh.write(data)
+            except OSError as exc:
+                return {"success": False, "count": len(files), "files": files,
+                        "message": f"Could not write file: {exc}"}
+            files.append(os.path.abspath(path))
+
+        return {"success": bool(files), "count": len(files), "files": files,
+                "message": f"Saved {len(files)} image(s)" if files else "No images written"}
 
     @staticmethod
     def _dataset_to_dict(dataset: Dataset) -> Dict[str, Any]:
