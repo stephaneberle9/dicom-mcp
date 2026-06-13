@@ -84,7 +84,7 @@ const fbEl     = document.getElementById("fallback");
 function showFallback(text, note) {
   pagesEl.classList.add("hidden");
   fbEl.classList.remove("hidden");
-  fbEl.textContent = text || "(kein Text extrahierbar)";
+  fbEl.textContent = text || "(no extractable text)";
   statusEl.textContent = note || "PDF preview unavailable – text version:";
 }
 
