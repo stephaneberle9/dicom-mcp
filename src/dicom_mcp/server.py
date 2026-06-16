@@ -72,6 +72,10 @@ function readToolData(result) {
   const t = (result?.content || []).find(c => c.type === "text");
   try { return JSON.parse(t?.text || "{}"); } catch (e) { return {}; }
 }
+// Heavy payloads ride in _meta (delivered to the widget, kept out of the model context).
+function readToolMeta(result) {
+  return (result && (result._meta || result.meta)) || {};
+}
 function b64ToBytes(b64) {
   const bin = atob(b64), len = bin.length, bytes = new Uint8Array(len);
   for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
@@ -119,7 +123,8 @@ app.ontoolresult = async (result) => {
                    series_instance_uid: data.series_instance_uid,
                    sop_instance_uid: data.sop_instance_uid },
     });
-    payload = readToolData(res);
+    const pm = readToolMeta(res);
+    payload = (pm && (pm.pdf_base64 || pm.text_content)) ? pm : readToolData(res);   // heavy payload rides in _meta
   } catch (e) {
     showFallback("", "Could not fetch the PDF (" + e + ")");
     return;
@@ -198,6 +203,10 @@ function readToolData(result) {
   const t = (result?.content || []).find(c => c.type === "text");
   try { return JSON.parse(t?.text || "{}"); } catch (e) { return {}; }
 }
+// Heavy payloads ride in _meta (delivered to the widget, kept out of the model context).
+function readToolMeta(result) {
+  return (result && (result._meta || result.meta)) || {};
+}
 const statusEl = document.getElementById("status");
 const grid = document.getElementById("grid");
 const lb = document.getElementById("lb");
@@ -235,7 +244,8 @@ async function openFull(sop, thumbSrc) {
       name: "get_single_image",
       arguments: { study_instance_uid: STUDY, series_instance_uid: SERIES, sop_instance_uid: sop },
     });
-    const d = readToolData(res);
+    const dm = readToolMeta(res);
+    const d = (dm && dm.image_base64) ? dm : readToolData(res);   // base64 rides in _meta
     if (d.image_base64) {
       lbimg.src = "data:" + (d.mime_type || "image/jpeg") + ";base64," + d.image_base64;
       lbStatus.textContent = "Click the image to close";
@@ -260,7 +270,8 @@ app.ontoolresult = async (result) => {
       name: "get_image_thumbnails",
       arguments: { study_instance_uid: STUDY, series_instance_uid: SERIES },
     });
-    data = readToolData(res);
+    const m = readToolMeta(res);
+    data = (m && m.images) ? m : readToolData(res);   // heavy data rides in _meta; fall back to structuredContent
   } catch (e) {
     statusEl.textContent = "Could not load images (" + e + ")";
     return;
@@ -338,6 +349,10 @@ function readToolData(result) {
   const t = (result?.content || []).find(c => c.type === "text");
   try { return JSON.parse(t?.text || "{}"); } catch (e) { return {}; }
 }
+// Heavy payloads ride in _meta (delivered to the widget, kept out of the model context).
+function readToolMeta(result) {
+  return (result && (result._meta || result.meta)) || {};
+}
 const statusEl = document.getElementById("status");
 const imgEl = document.getElementById("img");
 
@@ -366,7 +381,8 @@ app.ontoolresult = async (result) => {
                    series_instance_uid: meta.series_instance_uid,
                    sop_instance_uid: meta.sop_instance_uid },
     });
-    d = readToolData(res);
+    const dm = readToolMeta(res);
+    d = (dm && dm.image_base64) ? dm : readToolData(res);   // base64 rides in _meta
   } catch (e) {
     statusEl.textContent = "Could not load image (" + e + ")";
     return;
@@ -979,9 +995,10 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
             sop_instance_uid: SOP Instance UID
         """
         # Return ONLY the UIDs (no base64/text/file_path) so nothing tempting reaches the model -
-        # the widget pulls the payload via get_pdf_payload, a widget-side call that stays out of
-        # the model's context. (Claude Desktop surfaces structured_content to the model, so heavy
-        # fields placed here would otherwise be reprinted/saved by the model.)
+        # the widget pulls the payload via get_pdf_payload, which hands the heavy base64+text back in
+        # _meta (delivered to the widget but NOT surfaced to the model). NB: Claude Desktop DOES
+        # surface a widget-initiated call's content/structured_content to the model, so heavy fields
+        # must go in _meta, not structured_content - otherwise the model reprints/saves them.
         data = {
             "success": True,
             "study_instance_uid": study_instance_uid,
@@ -1024,8 +1041,11 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
             "pdf_base64": data.get("pdf_base64", ""),
             "text_content": data.get("text_content", ""),
         }
+        # PDF bytes AND the extracted report text ride in _meta (delivered to the widget, kept out of
+        # the model context - otherwise the model reproduces the report). structured_content stays slim.
+        slim = {"success": payload["success"], "message": payload["message"]}
         return ToolResult(content="(PDF payload delivered to the widget.)",
-                          structured_content=payload)
+                          structured_content=slim, meta=payload)
 
     @mcp.resource(
         "ui://dicom/pdf-view.html",
@@ -1100,7 +1120,18 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
             study_instance_uid=study_instance_uid,
             series_instance_uid=series_instance_uid,
         )
-        return ToolResult(content="(thumbnails delivered to the widget.)", structured_content=data)
+        # Claude Desktop surfaces a widget-initiated tool call's content/structured_content to the
+        # MODEL. Putting the thumbnails (base64) AND the per-image sop_instance_uids there floods the
+        # model context and - worse - lets the model proactively fetch every full image via
+        # get_single_image. So the heavy payload rides in _meta (verified: delivered to the widget,
+        # NOT to the model); structured_content keeps only a slim summary.
+        slim = {"success": data.get("success"), "count": data.get("count"),
+                "message": data.get("message")}
+        return ToolResult(
+            content="(thumbnails delivered to the widget.)",
+            structured_content=slim,
+            meta=data,
+        )
 
     @mcp.tool()
     def get_single_image(
@@ -1129,7 +1160,12 @@ def create_dicom_mcp_server(config_path: str, name: str = "DICOM MCP") -> FastMC
         )
         summary = ("Retrieved full-resolution image." if data.get("success")
                    else data.get("message", "No image."))
-        return ToolResult(content=summary, structured_content=data)
+        # Heavy base64 rides in _meta (delivered to the widget, kept out of the model context);
+        # structured_content stays slim. See get_image_thumbnails for the rationale.
+        slim = {"success": data.get("success"), "message": data.get("message"),
+                "sop_instance_uid": data.get("sop_instance_uid"),
+                "rows": data.get("rows"), "columns": data.get("columns")}
+        return ToolResult(content=summary, structured_content=slim, meta=data)
 
     # --- Download / save-to-disk tools ------------------------------------------
     @mcp.tool()
